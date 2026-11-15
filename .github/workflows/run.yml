@@ -1,0 +1,101 @@
+name: Download Torrent and Upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      torrent_url:
+        description: 'Torrent/Magnet URL'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # プロセス1: 不要なファイルを削除してストレージ確保
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      # プロセス2: 必要なパッケージをインストール
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 p7zip-full
+
+      # プロセス3: Torrent/Magnet URLからファイルをダウンロード
+      - name: Download from Torrent/Magnet
+        env:
+          TORRENT_URL: ${{ github.event.inputs.torrent_url }}
+        run: |
+          mkdir -p downloads
+          aria2c -d downloads \
+            --seed-time=0 \
+            --disable-ipv6 \
+            --force-sequential \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --file-allocation=none \
+            "$TORRENT_URL"
+
+      # プロセス4: フォルダが存在する場合は "/" でリネーム
+      - name: Flatten Directory Structure
+        run: |
+          cd downloads
+          # ダウンロードしたアイテムを再帰的に列挙し、ファイルパスを "/" 区切りで出力
+          find . -type f | sed 's|^\./||' > ../file_list.txt
+          echo "--- File list ---"
+          cat ../file_list.txt
+
+      # プロセス5: 1.9GiB以上のファイルをzipのpartで分割
+      - name: Split Large Files
+        run: |
+          cd downloads
+          mkdir -p ../upload_ready
+          LIMIT_BYTES=$((1900 * 1024 * 1024)) # 1.9 GiB (安全マージン込み)
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            file_size=$(stat -c%s "$file")
+            if [ "$file_size" -ge "$LIMIT_BYTES" ]; then
+              echo "Splitting: $file (${file_size} bytes)"
+              # zipのpart分割 (1.9GiB単位)
+              7z a -tzip -v1900m "../upload_ready/${file}.zip" "$file"
+            else
+              echo "Copying: $file"
+              mkdir -p "../upload_ready/$(dirname "$file")"
+              cp "$file" "../upload_ready/$file"
+            fi
+          done < ../file_list.txt
+
+          echo "--- Upload ready files ---"
+          find ../upload_ready -type f | sed 's|^\.\./upload_ready/||'
+
+      # プロセス6 & 7: GitHub Releaseを作成し、ファイルをアップロード
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: release-${{ github.run_number }}
+          name: Release ${{ github.run_number }}
+          body: |
+            Downloaded from: ${{ github.event.inputs.torrent_url }}
+          files: |
+            upload_ready/**/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # プロセス8: 終了（クリーンアップは不要）
